@@ -1,5 +1,6 @@
 # FIRST, you need to select a DB and schema + load package called snowflake-ml-python, if packages aren't loading, select a WH in the top right corner
 import snowflake.snowpark as snowpark
+import snowflake.snowpark.functions as F
 import pandas as pd
 from snowflake.ml.modeling.metrics import *
 
@@ -32,3 +33,6 @@ def main(session: snowpark.Session):
     print('Recall:', recall_score(df=scored_sdf, y_true_col_names='TX_FRAUD', y_pred_col_names='PREDICTION_RF'))
     print('F1:', f1_score(df=scored_sdf, y_true_col_names='TX_FRAUD', y_pred_col_names='PREDICTION_RF'))
 
+    # Check fraudulent transactions
+    scored_sdf = scored_sdf.filter(F.col("TX_FRAUD") == 1)
+    return scored_sdf
