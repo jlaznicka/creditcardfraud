@@ -4,6 +4,8 @@ import snowflake.snowpark.functions as F
 
 from snowflake.ml.modeling.linear_model import LogisticRegression
 from snowflake.ml.modeling.ensemble import RandomForestClassifier
+from snowflake.ml.registry import model_registry
+from snowflake.ml._internal.utils import identifier
 
 import datetime
 
@@ -77,6 +79,8 @@ def main(session: snowpark.Session):
     test_df=test_df.sort(F.col("TRANSACTION_ID"))
 
     return train_df
+    #return test_df
+    
     '''
     ################################################################################################################
     # Some simple statistics
@@ -127,5 +131,38 @@ def main(session: snowpark.Session):
     scored_snowml_sdf.write.save_as_table(table_name='CREDIT_CARD_FRAUD_SCORED', mode='overwrite')    
     
     # Return the test data set with predictions
-    return scored_snowml_sdf
-    '''
+    #return scored_snowml_sdf
+
+    ################################################################################################################
+    # Deploy the model
+    ################################################################################################################
+    
+    # Sample input data for registry logging
+    
+    # Database and schema identification
+    db = identifier._get_unescaped_name(session.get_current_database())
+    schema = identifier._get_unescaped_name(session.get_current_schema())
+    
+    # Registry setup
+    model_registry.create_model_registry(session=session, database_name=db, schema_name=schema)
+    registry = model_registry.ModelRegistry(session=session, database_name=db, schema_name=schema)
+    
+    # Log Logistic Regression Model
+    logistic_model_ref = registry.log_model(
+        model_name="LOGISTIC_FRAUD_DETECTION",
+        model_version='v1',  # Increment this for new versions
+        model=lm
+    )
+
+    #Let's confirm it was added
+    #return registry.list_models()
+   
+    # Deploy model and use it for prediction
+    logistic_model_ref.deploy(deployment_name="my_warehouse_predict",
+             target_method="predict",   
+             permanent=True)
+    
+    result_dataframe = logistic_model_ref.predict("my_warehouse_predict", test_df)
+    return result_dataframe[result_dataframe['PREDICTION_LM'] == 1]
+    
+'''

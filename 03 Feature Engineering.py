@@ -24,8 +24,11 @@ def main(session: snp.Session):
     # Customer Spending Behaviour Transformations
     ################################################################################################################
 
-    date_info = df_cust_trx_fraud.select(F.min(F.col("TX_DATETIME")).as_("END_DATE"), 
+    # Extracting the minimum and maximum transaction dates and calculating the number of days between them
+    ate_info = df_cust_trx_fraud.select(F.min(F.col("TX_DATETIME")).as_("END_DATE"), 
                                      F.datediff("DAY", F.col("END_DATE"), F.max(F.col("TX_DATETIME"))).as_("NO_DAYS")).to_pandas()
+    
+    # Converting the number of days to an integer and formatting the start date
     days = int(date_info['NO_DAYS'].values[0])
     start_date = str(date_info['END_DATE'].values[0].astype('datetime64[D]'))
     
@@ -43,22 +46,42 @@ def main(session: snp.Session):
     # Number of transactions and amount by customer and day
     zero_if_null = F.function("ZEROIFNULL")
 
-    df_cust_trx_day = df_cust_trx_fraud.join(df_cust_day, (df_cust_trx_fraud["CUSTOMER_ID"] == df_cust_day["CUSTOMER_ID"]) \
-                                             & (F.to_date(df_cust_trx_fraud["TX_DATETIME"]) == df_cust_day["TX_DATE"]), "rightouter") \
-                .select(df_cust_day.col("CUSTOMER_ID").as_("CUSTOMER_ID"),\
-                        df_cust_day.col("TX_DATE"),\
-                        zero_if_null(df_cust_trx_fraud["TX_AMOUNT"]).as_("TX_AMOUNT"),\
-                        F.iff(F.col("TX_AMOUNT") > F.lit(0), F.lit(1), F.lit(0)).as_("NO_TRX"))\
-                    .group_by(F.col("CUSTOMER_ID"), F.col("TX_DATE"))\
-                    .agg([F.sum(F.col("TX_AMOUNT")).as_("TOT_AMOUNT"), F.sum(F.col("NO_TRX")).as_("NO_TRX")])
+    # Joining customer transaction data with customer-day data
+    df_cust_trx_day = (df_cust_trx_fraud
+                       .join(
+                           df_cust_day, 
+                           # Join condition: Matching CUSTOMER_ID and the transaction date (TX_DATETIME) with each day
+                           (df_cust_trx_fraud["CUSTOMER_ID"] == df_cust_day["CUSTOMER_ID"]) &
+                           (F.to_date(df_cust_trx_fraud["TX_DATETIME"]) == df_cust_day["TX_DATE"]), 
+                           "rightouter"  # Right outer join to keep all rows from df_cust_day
+                       )
+                       .select(
+                           df_cust_day.col("CUSTOMER_ID").alias("CUSTOMER_ID"),  # Selecting customer ID
+                           df_cust_day.col("TX_DATE"),                           # Selecting transaction date
+                           # If transaction amount is null, replace with zero, else use the transaction amount
+                           zero_if_null(df_cust_trx_fraud["TX_AMOUNT"]).alias("TX_AMOUNT"),
+                           # If transaction amount is greater than 0, mark as 1, else 0 (indicating presence of transaction)
+                           F.iff(F.col("TX_AMOUNT") > F.lit(0), F.lit(1), F.lit(0)).alias("NO_TRX")
+                       )
+                       # Grouping the data by CUSTOMER_ID and TX_DATE
+                       .group_by(F.col("CUSTOMER_ID"), F.col("TX_DATE"))
+                       # Aggregating total transaction amount and number of transactions per group
+                       .agg(
+                           [F.sum(F.col("TX_AMOUNT")).alias("TOT_AMOUNT"),  # Sum of transaction amounts
+                            F.sum(F.col("NO_TRX")).alias("NO_TRX")]         # Count of transactions
+                       )
+    )
+
     
     ######## return df_cust_trx_day
 
     # Now when we have the number of transactions and amount by customer and day we can aggregate by our windows (1, 7 and 30 days).
+    # Setting up window specifications for aggregating customer transaction data
     cust_date = Window.partition_by(F.col("customer_id")).orderBy(F.col("TX_DATE"))
-    win_7d_cust = cust_date.rowsBetween(-7, -1)
-    win_30d_cust = cust_date.rowsBetween(-30, -1)
+    win_7d_cust = cust_date.rowsBetween(-7, -1) # Window for the past 7 days
+    win_30d_cust = cust_date.rowsBetween(-30, -1) # Window for the past 30 days
     
+    # Creating a new DataFrame with additional features based on transaction history
     df_cust_feat_day = df_cust_trx_day.select(F.col("TX_DATE"),F.col("CUSTOMER_ID"),F.col("NO_TRX"),F.col("TOT_AMOUNT"),
                                   F.lag(F.col("NO_TRX"),1).over(cust_date).as_("CUST_TX_PREV_1"),
                                   F.sum(F.col("NO_TRX")).over(win_7d_cust).as_("CUST_TX_PREV_7"),
@@ -71,32 +94,47 @@ def main(session: snp.Session):
 
     # Now we know for each customer and day the number of transactions and amount for previous 1, 7 and 30 days and we add that to our transactions.
 
-    win_cur_date = Window.partition_by(F.col("PARTITION_KEY")).order_by(F.col("TX_DATETIME")).rangeBetween(Window.unboundedPreceding,Window.currentRow)
+    # Setting up a window for current and preceding rows based on the partition key and transaction datetime
+    win_cur_date = Window.partition_by(F.col("PARTITION_KEY")).order_by(F.col("TX_DATETIME")).rangeBetween(Window.unboundedPreceding, Window.currentRow)
     
-    df_cust_behaviur_feat = df_date_time_feat.join(df_cust_feat_day, (df_date_time_feat["CUSTOMER_ID"] == df_cust_feat_day["CUSTOMER_ID"]) & \
-                                                 (F.to_date(df_date_time_feat["TX_DATETIME"]) == df_cust_feat_day["TX_DATE"]))\
-            .with_column("PARTITION_KEY", F.concat(df_date_time_feat["CUSTOMER_ID"], F.to_date(df_date_time_feat["TX_DATETIME"])))\
-            .with_columns(["CUR_DAY_TRX",
-                             "CUR_DAY_AMT"],\
-                          [F.count(df_date_time_feat["CUSTOMER_ID"]).over(win_cur_date),
-                          F.sum(df_date_time_feat["TX_AMOUNT"]).over(win_cur_date)])\
-            .select(df_date_time_feat["TRANSACTION_ID"],
-                    df_date_time_feat["CUSTOMER_ID"].as_("CUSTOMER_ID"),
-                    df_date_time_feat["TERMINAL_ID"],
-                    df_date_time_feat["TX_DATETIME"].as_("TX_DATETIME"),
-                    df_date_time_feat["TX_AMOUNT"],
-                    df_date_time_feat["TX_TIME_SECONDS"],
-                    df_date_time_feat["TX_TIME_DAYS"],
-                    df_date_time_feat["TX_FRAUD"],
-                    df_date_time_feat["TX_FRAUD_SCENARIO"],
-                    df_date_time_feat["TX_DURING_WEEKEND"],
-                    df_date_time_feat["TX_DURING_NIGHT"],
-                    (zero_if_null(df_cust_feat_day["CUST_TX_PREV_1"]) + F.col("CUR_DAY_TRX")).as_("CUST_CNT_TX_1"),
-                    ((zero_if_null(df_cust_feat_day["CUST_TOT_AMT_PREV_1"]) + F.col("CUR_DAY_AMT")) / F.col("CUST_CNT_TX_1")).as_("CUST_AVG_AMOUNT_1"),
-                    (zero_if_null(df_cust_feat_day["CUST_TX_PREV_7"]) + F.col("CUR_DAY_TRX")).as_("CUST_CNT_TX_7"),
-                    ((zero_if_null(df_cust_feat_day["CUST_TOT_AMT_PREV_7"]) + F.col("CUR_DAY_AMT")) / F.col("CUST_CNT_TX_7")).as_("CUST_AVG_AMOUNT_7"),
-                    (zero_if_null(df_cust_feat_day["CUST_TX_PREV_30"]) + F.col("CUR_DAY_TRX")).as_("CUST_CNT_TX_30"),
-                    ((zero_if_null(df_cust_feat_day["CUST_TOT_AMT_PREV_30"]) + F.col("CUR_DAY_AMT")) / F.col("CUST_CNT_TX_30")).as_("CUST_AVG_AMOUNT_30"))
+    # Joining and enhancing the customer transaction features with current day statistics
+    df_cust_behaviur_feat = (
+        df_date_time_feat
+        .join(
+            df_cust_feat_day, 
+            (df_date_time_feat["CUSTOMER_ID"] == df_cust_feat_day["CUSTOMER_ID"]) &
+            (F.to_date(df_date_time_feat["TX_DATETIME"]) == df_cust_feat_day["TX_DATE"])
+        )
+        .with_column(
+            "PARTITION_KEY", 
+            F.concat(df_date_time_feat["CUSTOMER_ID"], F.to_date(df_date_time_feat["TX_DATETIME"]))
+        )
+        .with_columns(
+            ["CUR_DAY_TRX", "CUR_DAY_AMT"],
+            [F.count(df_date_time_feat["CUSTOMER_ID"]).over(win_cur_date),
+             F.sum(df_date_time_feat["TX_AMOUNT"]).over(win_cur_date)]
+        )
+        .select(
+            df_date_time_feat["TRANSACTION_ID"],
+            df_date_time_feat["CUSTOMER_ID"].as_("CUSTOMER_ID"),
+            df_date_time_feat["TERMINAL_ID"],
+            df_date_time_feat["TX_DATETIME"].as_("TX_DATETIME"),
+            df_date_time_feat["TX_AMOUNT"],
+            df_date_time_feat["TX_TIME_SECONDS"],
+            df_date_time_feat["TX_TIME_DAYS"],
+            df_date_time_feat["TX_FRAUD"],
+            df_date_time_feat["TX_FRAUD_SCENARIO"],
+            df_date_time_feat["TX_DURING_WEEKEND"],
+            df_date_time_feat["TX_DURING_NIGHT"],
+            # Additional statistics and features calculated for the current and preceding rows
+            (zero_if_null(df_cust_feat_day["CUST_TX_PREV_1"]) + F.col("CUR_DAY_TRX")).as_("CUST_CNT_TX_1"),
+            ((zero_if_null(df_cust_feat_day["CUST_TOT_AMT_PREV_1"]) + F.col("CUR_DAY_AMT")) / F.col("CUST_CNT_TX_1")).as_("CUST_AVG_AMOUNT_1"),
+            (zero_if_null(df_cust_feat_day["CUST_TX_PREV_7"]) + F.col("CUR_DAY_TRX")).as_("CUST_CNT_TX_7"),
+            ((zero_if_null(df_cust_feat_day["CUST_TOT_AMT_PREV_7"]) + F.col("CUR_DAY_AMT")) / F.col("CUST_CNT_TX_7")).as_("CUST_AVG_AMOUNT_7"),
+            (zero_if_null(df_cust_feat_day["CUST_TX_PREV_30"]) + F.col("CUR_DAY_TRX")).as_("CUST_CNT_TX_30"),
+            ((zero_if_null(df_cust_feat_day["CUST_TOT_AMT_PREV_30"]) + F.col("CUR_DAY_AMT")) / F.col("CUST_CNT_TX_30")).as_("CUST_AVG_AMOUNT_30")
+        )
+    )
 
     ######## return df_cust_behaviur_feat
 
@@ -108,7 +146,7 @@ def main(session: snp.Session):
     df_terminals = session.table("TERMINALS").select("TERMINAL_ID")
     df_term_day = df_days.join(df_terminals)
     
-    # Aggregate number of transactions and amount by terminal and date, for dates where a terminal do not have any ttransactions we ad a 0
+    # Aggregate number of transactions and amount by terminal and date, for dates where a terminal do not have any transactions we add a 0
     df_term_trx_by_day = df_cust_trx_fraud.join(df_term_day, (df_cust_trx_fraud["TERMINAL_ID"] == df_term_day["TERMINAL_ID"])\
                         & (F.to_date(df_cust_trx_fraud["TX_DATETIME"]) == df_term_day["TX_DATE"]), "rightouter")\
                     .select(df_term_day["TERMINAL_ID"].as_("TERMINAL_ID"),
